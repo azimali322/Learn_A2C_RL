@@ -52,69 +52,49 @@ class NoisyLinear(nn.Module):
         return nn.functional.linear(x, weight, bias)
 
 class ActorCritic(nn.Module):
-    def __init__(self, input_dim, n_actions, hidden_dim=256):
+    def __init__(self, state_dim, n_actions, hidden_dim=400):
         super(ActorCritic, self).__init__()
         
-        # Shared feature extractor with residual connections
-        self.feature_layer = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            ResidualBlock(hidden_dim),
-            ResidualBlock(hidden_dim),
-            nn.Dropout(0.1)
+        # Value network (critic)
+        self.value_network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, 1)
         )
         
-        # Actor head with noisy layers for exploration
-        self.actor = nn.Sequential(
-            NoisyLinear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            NoisyLinear(hidden_dim // 2, n_actions)
-        )
-        self.temperature = nn.Parameter(torch.ones(1) * 1.0)
-        
-        # Critic head with value bounds
-        self.critic = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+        # Policy network (actor)
+        self.policy_network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU()
         )
         
-        # Initialize weights
-        self._init_weights()
+        # Policy head
+        self.policy_mu = nn.Linear(hidden_dim, n_actions)
+        self.policy_sigma = nn.Linear(hidden_dim, n_actions)
         
-    def _init_weights(self):
-        # Initialize linear layers
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=0.5)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, NoisyLinear):
-                # NoisyLinear layers are already initialized in their constructor
-                continue
+        # Initialize weights using Xavier initialization
+        self.apply(self._init_weights)
     
-    def reset_noise(self):
-        for module in self.actor.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                module.bias.data.zero_()
     
-    def forward(self, x):
-        if len(x.shape) == 1:
-            x = x.unsqueeze(0)
-        features = self.feature_layer(x)
+    def forward(self, state):
+        # Value prediction
+        value = self.value_network(state)
         
-        # Get logits and apply temperature scaling
-        logits = self.actor(features)
-        scaled_logits = logits / self.temperature
+        # Policy prediction
+        policy_features = self.policy_network(state)
+        mu = self.policy_mu(policy_features)
+        sigma = torch.nn.functional.softplus(self.policy_sigma(policy_features)) + 1e-5
         
-        # Compute log probabilities with numerical stability
-        log_probs = torch.log_softmax(scaled_logits, dim=-1)
-        
-        state_value = self.critic(features)
-        return log_probs, state_value
+        return value, mu, sigma
 
 class ResidualBlock(nn.Module):
     def __init__(self, hidden_dim):
@@ -191,19 +171,22 @@ class PrioritizedReplayBuffer:
         self.priorities[indices] = priorities
 
 class A2CAgent:
-    def __init__(self, state_dim, n_actions, hidden_dim=256, lr=0.001, gamma=0.99):
+    def __init__(self, state_dim, n_actions, hidden_dim=400, lr_actor=0.00002, lr_critic=0.001, gamma=0.99, state_scaler=None):
+        self.state_dim = state_dim
+        self.n_actions = n_actions
         self.gamma = gamma
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.gae_lambda = 0.95
-        self.n_steps = 5
-        self.value_clip = 0.2
-        self.max_grad_norm = 0.5
+        self.state_scaler = state_scaler
         
-        # Enhanced exploration parameters
-        self.entropy_coef = 0.2
-        self.min_entropy = 0.8
-        self.exploration_bonus = 0.05
-        self.curiosity_weight = 0.2
+        # Initialize networks
+        self.actor_critic = ActorCritic(state_dim, n_actions, hidden_dim)
+        
+        # Initialize optimizers
+        self.actor_optimizer = optim.Adam(self.actor_critic.policy_network.parameters(), lr=lr_actor)
+        self.critic_optimizer = optim.Adam(self.actor_critic.value_network.parameters(), lr=lr_critic)
+        
+        # Initialize replay buffer
+        self.replay_buffer = deque(maxlen=10000)
+        self.min_replay_size = 1000
         
         # Initialize reward statistics
         self.reward_scaling = 1.0
@@ -225,40 +208,6 @@ class A2CAgent:
         self.velocity_momentum = 0
         self.momentum_decay = 0.95
         
-        # Experience replay parameters
-        self.replay_buffer = PrioritizedReplayBuffer()
-        self.batch_size = 64
-        self.min_replay_size = 1000
-        self.replay_ratio = 4  # Number of replay updates per environment step
-        
-        # Model saving parameters
-        self.best_score = float('-inf')
-        self.best_position = float('-inf')
-        self.save_dir = 'saved_models'
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
-        
-        # Initialize actor-critic network
-        self.network = ActorCritic(state_dim, n_actions, hidden_dim).to(self.device)
-        
-        # Separate optimizers with different learning rates
-        actor_params = list(self.network.feature_layer.parameters()) + list(self.network.actor.parameters()) + [self.network.temperature]
-        critic_params = list(self.network.feature_layer.parameters()) + list(self.network.critic.parameters())
-        
-        self.actor_optimizer = optim.Adam(actor_params, lr=lr, eps=1e-5)
-        self.critic_optimizer = optim.Adam(critic_params, lr=lr*2, eps=1e-5)
-        
-        # Learning rate scheduling with warmup
-        self.actor_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.actor_optimizer, T_0=1000, T_mult=2, eta_min=lr*0.1
-        )
-        self.critic_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.critic_optimizer, T_0=1000, T_mult=2, eta_min=lr*0.2
-        )
-        
-        # Initialize memory
-        self.clear_memory()
-        
         # Performance tracking
         self.best_reward = float('-inf')
         self.best_position = float('-inf')
@@ -270,6 +219,75 @@ class A2CAgent:
         self.state_visitation_counts = {}
         self.state_values = {}
         self.novelty_threshold = 10
+    
+    def scale_state(self, state):
+        if self.state_scaler is not None:
+            return self.state_scaler.transform([state])[0]
+        return state
+    
+    def choose_action(self, state):
+        state = torch.FloatTensor(self.scale_state(state))
+        with torch.no_grad():
+            _, mu, sigma = self.actor_critic(state)
+            action_dist = torch.distributions.Normal(mu, sigma)
+            action = action_dist.sample()
+            # Clip action to environment bounds
+            action = torch.clamp(action, -1.0, 1.0)
+        return action.numpy()
+    
+    def store_transition(self, state, action, reward, next_state, done):
+        self.replay_buffer.append((state, action, reward, next_state, done))
+    
+    def learn(self):
+        if len(self.replay_buffer) < self.min_replay_size:
+            return
+        
+        # Sample batch
+        batch = random.sample(self.replay_buffer, 32)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        # Convert to tensors
+        states = torch.FloatTensor([self.scale_state(s) for s in states])
+        actions = torch.FloatTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        next_states = torch.FloatTensor([self.scale_state(s) for s in next_states])
+        dones = torch.FloatTensor(dones)
+        
+        # Compute value predictions
+        current_values, current_mu, current_sigma = self.actor_critic(states)
+        next_values, _, _ = self.actor_critic(next_states)
+        
+        # Compute TD target and advantage
+        td_target = rewards + self.gamma * next_values.squeeze() * (1 - dones)
+        advantage = td_target.detach() - current_values.squeeze()
+        
+        # Update critic
+        critic_loss = nn.MSELoss()(current_values.squeeze(), td_target.detach())
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        
+        # Update actor
+        action_dist = torch.distributions.Normal(current_mu, current_sigma)
+        log_probs = action_dist.log_prob(actions)
+        actor_loss = -(log_probs * advantage.detach()).mean()
+        
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+    
+    def save_model(self, path):
+        torch.save({
+            'actor_critic_state_dict': self.actor_critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict()
+        }, path)
+    
+    def load_model(self, path):
+        checkpoint = torch.load(path)
+        self.actor_critic.load_state_dict(checkpoint['actor_critic_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
     
     def compute_potential(self, state):
         """Compute potential for reward shaping with enhanced exploration signals"""
@@ -525,40 +543,6 @@ class A2CAgent:
         self.rewards = []
         self.next_states = []
         self.dones = []
-        
-    def save_model(self, filename):
-        state = {
-            'network_state': self.network.state_dict(),
-            'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic_optimizer': self.critic_optimizer.state_dict(),
-            'actor_scheduler': self.actor_scheduler.state_dict(),
-            'critic_scheduler': self.critic_scheduler.state_dict(),
-            'best_score': self.best_score,
-            'best_position': self.best_position,
-            'reward_stats': {
-                'mean': self.reward_running_mean,
-                'std': self.reward_running_std,
-                'count': self.reward_count
-            },
-            'state_visitation': self.state_visitation_counts
-        }
-        torch.save(state, os.path.join(self.save_dir, filename))
-        
-    def load_model(self, filename):
-        state = torch.load(os.path.join(self.save_dir, filename))
-        self.network.load_state_dict(state['network_state'])
-        self.actor_optimizer.load_state_dict(state['actor_optimizer'])
-        self.critic_optimizer.load_state_dict(state['critic_optimizer'])
-        self.actor_scheduler.load_state_dict(state['actor_scheduler'])
-        self.critic_scheduler.load_state_dict(state['critic_scheduler'])
-        self.best_score = state['best_score']
-        self.best_position = state['best_position']
-        stats = state['reward_stats']
-        self.reward_running_mean = stats['mean']
-        self.reward_running_std = stats['std']
-        self.reward_count = stats['count']
-        if 'state_visitation' in state:
-            self.state_visitation_counts = state['state_visitation']
         
     def evaluate(self, env, n_episodes=10, render=False):
         """Evaluate the current model for n episodes"""
