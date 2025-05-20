@@ -1,45 +1,52 @@
-# Actor-Critic Advantage (A2C) RL Implementation
+# MountainCar A2C Reinforcement Learning
 
-This project implements an A2C reinforcement learning agent to solve the CartPole environment from Gymnasium (formerly OpenAI Gym).
+This project implements an Actor-Critic (A2C) reinforcement learning agent using Stable-Baselines3 to solve the MountainCar-v0 environment from Gymnasium.
 
-## Environment Description
-CartPole is a classic control problem where a pole is attached to a cart that moves along a track. The goal is to prevent the pole from falling over by moving the cart left or right.
+## Requirements
 
-### State Space (4 dimensions):
-- Cart Position
-- Cart Velocity
-- Pole Angle
-- Pole Angular Velocity
-
-### Action Space (2 actions):
-- Push cart left
-- Push cart right
-
-### Reward:
-- +1 for every timestep the pole remains upright
-- Episode ends when:
-  - Pole angle is more than ±12 degrees
-  - Cart position is more than ±2.4 units
-  - Episode length reaches 500 timesteps
-
-## Setup
-1. Create a virtual environment (optional but recommended):
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-2. Install dependencies:
+Install the required packages using:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Run the training:
+## Project Structure
+
+- `train_a2c.py`: Main training script for the A2C agent
+- `requirements.txt`: List of required Python packages
+- `logs/`: Directory containing training logs and saved models
+  - `best_model/`: Best model saved during training
+  - `eval_logs/`: Evaluation logs
+  - `training_rewards.png`: Plot of training rewards
+  - `episode_lengths.png`: Plot of episode lengths
+
+## Training the Agent
+
+To train the agent, simply run:
 ```bash
-python train.py
+python train_a2c.py
 ```
 
-## Project Structure
-- `train.py`: Main training loop
-- `a2c_agent.py`: Implementation of the A2C agent
-- `environment.py`: Environment wrapper and utilities 
+The script will:
+1. Create a MountainCar environment
+2. Initialize an A2C agent
+3. Train the agent for 100,000 timesteps
+4. Save the best model during training
+5. Test the final model
+6. Generate plots of training progress
+
+## Monitoring Training
+
+The training progress can be monitored through:
+- Console output showing training statistics
+- TensorBoard logs in the `logs/` directory
+- Generated plots of rewards and episode lengths
+
+## Model Parameters
+
+The A2C agent is configured with the following parameters:
+- Learning rate: 0.0007
+- Number of steps: 5
+- Discount factor (gamma): 0.99
+- Policy network: MLP (Multi-Layer Perceptron)
+
+You can modify these parameters in the `train_a2c.py` script to experiment with different configurations. 
